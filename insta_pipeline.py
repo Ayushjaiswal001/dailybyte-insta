@@ -28,7 +28,7 @@ def generate_post_content(topic: str, niche: str) -> dict:
         sys.exit(1)
 
     genai.configure(api_key=api_key.strip(), transport="rest")
-    model = genai.GenerativeModel("gemini-2.0-flash")
+    model = genai.GenerativeModel("gemini-1.5-flash")
 
     topic_part = f'about "{topic}"' if topic else f"trending in {niche}"
 
