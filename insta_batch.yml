@@ -1,0 +1,33 @@
+name: TheDailyByte — Batch Posts
+on:
+  workflow_dispatch:
+    inputs:
+      niche: {description: "Niche", required: false, default: "tech", type: choice, options: ["tech", "health"]}
+      count: {description: "Post count", required: false, default: "5", type: string}
+  schedule:
+    - cron: "0 3 * * 0"   # Sunday 8:30AM IST weekly batch
+
+jobs:
+  batch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: "3.11", cache: "pip"}
+      - run: pip install -r requirements.txt
+
+      - name: Generate batch posts
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: |
+          NICHE="${{ github.event.inputs.niche || 'tech' }}"
+          COUNT="${{ github.event.inputs.count || '5' }}"
+          python insta_batch.py --niche "$NICHE" --count "$COUNT"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: insta-batch-${{ github.event.inputs.niche }}-${{ github.run_id }}
+          path: output/batch/**/*
+          retention-days: 7
