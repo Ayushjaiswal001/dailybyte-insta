@@ -24,15 +24,23 @@ def generate_post_content(topic: str, niche: str) -> dict:
     """Generate Instagram post content using Gemini AI."""
     api_key = os.environ.get("GEMINI_API_KEY")
     if not api_key:
-        print("ERROR: GEMINI_API_KEY not set", file=sys.stderr)
-        sys.exit(1)
+        print("WARN: GEMINI_API_KEY not set, using template", file=sys.stderr)
+        return {
+            "headline": f"{niche.title()} Daily Byte",
+            "subheadline": f"Today's {niche} insight",
+            "points": [f"Key insight about {niche}", f"Latest {niche} trend", f"Pro {niche} tip"],
+            "caption": f"📱 Daily byte of {niche} knowledge! Follow for more daily insights. #{niche} #dailybyte #learning #tech #tips",
+            "image_query": niche,
+            "topic_used": topic or niche,
+        }
 
-    genai.configure(api_key=api_key.strip(), transport="rest")
-    model = genai.GenerativeModel("gemini-1.5-flash")
+    try:
+        genai.configure(api_key=api_key.strip(), transport="rest")
+        model = genai.GenerativeModel("gemini-1.5-flash")
 
-    topic_part = f'about "{topic}"' if topic else f"trending in {niche}"
+        topic_part = f'about "{topic}"' if topic else f"trending in {niche}"
 
-    prompt = f"""Create an Instagram carousel-style educational post {topic_part}.
+        prompt = f"""Create an Instagram carousel-style educational post {topic_part}.
 Niche: {niche}
 
 Return ONLY a JSON object with:
@@ -45,16 +53,16 @@ Return ONLY a JSON object with:
 
 Raw JSON only."""
 
-    response = model.generate_content(prompt)
-    text = response.text.strip()
-    if text.startswith("```"):
-        text = text.split("\n", 1)[1]
-    if text.endswith("```"):
-        text = text.rsplit("```", 1)[0]
+        response = model.generate_content(prompt)
+        text = response.text.strip()
+        if text.startswith("```"):
+            text = text.split("\n", 1)[1]
+        if text.endswith("```"):
+            text = text.rsplit("```", 1)[0]
 
-    try:
         return json.loads(text.strip())
-    except json.JSONDecodeError:
+    except Exception as e:
+        print(f"WARN: Gemini failed ({e}), using template", file=sys.stderr)
         return {
             "headline": f"{niche.title()} Daily Byte",
             "subheadline": f"Today's top {niche} insight",
