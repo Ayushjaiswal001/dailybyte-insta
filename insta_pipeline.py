@@ -1,288 +1,262 @@
-#!/usr/bin/env python3
-"""
-TheDailyByte — Instagram Auto Post Pipeline
-Generates an informative image post and publishes to Instagram via Graph API.
-"""
-
-import argparse
-import json
-import os
-import sys
-import textwrap
+import asyncio, json, os, subprocess, sys, tempfile, random, time, logging, requests
 from pathlib import Path
+from PIL import Image, ImageDraw, ImageFont, ImageFilter
+import edge_tts
+from functools import wraps
 
-import google.generativeai as genai
-import requests
-from PIL import Image, ImageDraw, ImageFont
+# Configure logging
+logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"), format="%(asctime)s - %(levelname)s - %(message)s")
 
+def get_env_var(name, default=None):
+    value = os.getenv(name)
+    if value is None:
+        logging.warning(f"Environment variable {name} not set. Using default: {default}")
+        return default
+    return value
 
-# ──────────────────────────────────────────────────
-# 1. CONTENT GENERATION (Gemini)
-# ──────────────────────────────────────────────────
+# --- Configuration ---
+GEMINI_API_KEY = get_env_var("GEMINI_API_KEY", "").strip()
+INSTAGRAM_BUSINESS_ACCOUNT_ID = get_env_var("INSTAGRAM_BUSINESS_ACCOUNT_ID", "").strip()
+INSTAGRAM_ACCESS_TOKEN = get_env_var("INSTAGRAM_ACCESS_TOKEN", "").strip()
+PEXELS_API_KEY = get_env_var("PEXELS_API_KEY", "").strip()
 
-def generate_post_content(topic: str, niche: str) -> dict:
-    """Generate Instagram post content using Gemini AI."""
-    api_key = os.environ.get("GEMINI_API_KEY")
+OUTPUT_DIR = get_env_var("OUTPUT_DIR", "./output/insta")
+
+TTS_VOICE = get_env_var("TTS_VOICE", "en-US-ChristopherNeural")
+TTS_RATE = get_env_var("TTS_RATE", "+5%")
+
+MAX_RETRIES = int(get_env_var("MAX_RETRIES", "3"))
+RETRY_DELAY = int(get_env_var("RETRY_DELAY", "5"))
+
+INSTA_IMAGE_RESOLUTION = "1080x1350"
+VIDEO_CODEC = "libx264"
+AUDIO_CODEC = "aac"
+FFMPEG_PRESET = "fast"
+
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+BUILT_IN_TOPICS = {
+    "tech": [
+        {"topic": "The AI Secret Google Doesn't Want You to Know", "description": "Uncovering the hidden truth about AI agents.", "tags": ["ai", "google", "secret", "tech", "future"]},
+        {"topic": "Why Your Phone is Actually Listening to You", "description": "The technical proof behind mobile eavesdropping.", "tags": ["privacy", "tech", "phone", "hacking", "safety"]},
+        {"topic": "The 3-Minute Habit That Doubles Your IQ", "description": "A simple tech-driven habit for cognitive enhancement.", "tags": ["iq", "productivity", "tech", "brain", "habit"]},
+    ],
+    "kids": [
+        {"topic": "The Secret Language of Talking Animals", "description": "A magical discovery in the forest.", "tags": ["kids", "story", "magic", "animals"]},
+        {"topic": "Why the Moon Changes Shape Every Night", "description": "Fun moon phases explanation for kids.", "tags": ["kids", "science", "moon", "educational"]},
+    ],
+    "health": [
+        {"topic": "The One Fruit That Reverses Aging (Science)", "description": "New research on longevity and nutrition.", "tags": ["health", "longevity", "aging", "nutrition"]},
+        {"topic": "Cold Plunge Science — What Happens to Your Body", "description": "Real science behind cold water immersion", "tags": ["health", "coldplunge", "science", "biohacking"]},
+    ],
+}
+
+current_insta_topic_index = 0
+
+def retry(exceptions, tries=MAX_RETRIES, delay=RETRY_DELAY, backoff=2):
+    def deco_retry(f):
+        @wraps(f)
+        def f_retry(*args, **kwargs):
+            mtries, mdelay = tries, delay
+            while mtries > 1:
+                try:
+                    return f(*args, **kwargs)
+                except exceptions as e:
+                    logging.warning(f"{f.__name__} failed: {e}. Retrying in {mdelay}s...")
+                    time.sleep(mdelay)
+                    mtries -= 1
+                    mdelay *= backoff
+            return f(*args, **kwargs)
+        return f_retry
+    return deco_retry
+
+def pick_topic(topic_arg, niche):
+    global current_insta_topic_index
+    if topic_arg and topic_arg.strip():
+        return topic_arg.strip()
+    niche_topics = BUILT_IN_TOPICS.get(niche, BUILT_IN_TOPICS["tech"])
+    if not niche_topics:
+        return f"Latest {niche} trends"
+    topic_data = niche_topics[current_insta_topic_index % len(niche_topics)]
+    current_insta_topic_index += 1
+    logging.info(f"Picked built-in topic: {topic_data['topic']} for niche: {niche}")
+    return topic_data['topic']
+
+@retry(Exception)
+def _generate_caption_gemini(topic, niche):
+    api_key = GEMINI_API_KEY
     if not api_key:
-        print("WARN: GEMINI_API_KEY not set, using template", file=sys.stderr)
-        return {
-            "headline": f"{niche.title()} Daily Byte",
-            "subheadline": f"Today's {niche} insight",
-            "points": [f"Key insight about {niche}", f"Latest {niche} trend", f"Pro {niche} tip"],
-            "caption": f"📱 Daily byte of {niche} knowledge! Follow for more daily insights. #{niche} #dailybyte #learning #tech #tips",
-            "image_query": niche,
-            "topic_used": topic or niche,
-        }
-
+        return None
     try:
+        try:
+            import google.genai as genai
+        except ImportError:
+            import google.generativeai as genai
         genai.configure(api_key=api_key.strip(), transport="rest")
         model = genai.GenerativeModel("gemini-1.5-flash")
-
-        topic_part = f'about "{topic}"' if topic else f"trending in {niche}"
-
-        prompt = f"""Create an Instagram carousel-style educational post {topic_part}.
-Niche: {niche}
-
-Return ONLY a JSON object with:
-- "headline": bold attention-grabbing headline (max 50 chars)
-- "subheadline": one-line hook (max 80 chars)  
-- "points": array of 3-5 key facts/tips, each a short string (max 60 chars each)
-- "caption": Instagram caption with emojis and 15 hashtags (max 2000 chars)
-- "image_query": a Pexels search query for the background image
-- "topic_used": the actual topic covered
-
-Raw JSON only."""
-
+        prompt = (
+            f"Create an Instagram caption for a post about: {topic}. Niche: {niche}. "
+            "1. Hook (first line): Curiosity-driven, max 15 words. "
+            "2. Body (2-3 lines): Educational insight with pattern interrupt. "
+            "3. CTA: Call to action (like, comment, save, follow). "
+            "Return JSON only: { \"caption\", \"hashtags\": [] }."
+        )
         response = model.generate_content(prompt)
         text = response.text.strip()
-        if text.startswith("```"):
-            text = text.split("\n", 1)[1]
-        if text.endswith("```"):
-            text = text.rsplit("```", 1)[0]
-
+        if text.startswith("```"): text = text.split("\n",1)[1] if "\n" in text else text[3:]
+        if text.endswith("```"): text = text.rsplit("```",1)[0]
         return json.loads(text.strip())
     except Exception as e:
-        print(f"WARN: Gemini failed ({e}), using template", file=sys.stderr)
-        return {
-            "headline": f"{niche.title()} Daily Byte",
-            "subheadline": f"Today's top {niche} insight",
-            "points": [f"Key insight about {niche}"],
-            "caption": f"Daily byte of {niche} knowledge! #{niche} #dailybyte #learning",
-            "image_query": niche,
-            "topic_used": topic or niche,
-        }
+        logging.error(f"Gemini caption generation failed: {e}")
+        raise
 
-
-# ──────────────────────────────────────────────────
-# 2. IMAGE GENERATION
-# ──────────────────────────────────────────────────
-
-def download_pexels_image(query: str, output_path: str) -> bool:
-    """Download a background image from Pexels."""
-    api_key = os.environ.get("PEXELS_API_KEY")
-    if not api_key:
-        return False
-
-    headers = {"Authorization": api_key}
-    params = {"query": query, "per_page": 5, "orientation": "square"}
+def generate_caption(topic, niche):
     try:
-        resp = requests.get("https://api.pexels.com/v1/search", headers=headers, params=params, timeout=15)
-        resp.raise_for_status()
-        photos = resp.json().get("photos", [])
-        if not photos:
-            return False
-
-        img_url = photos[0]["src"]["large2x"]
-        r = requests.get(img_url, timeout=30)
-        r.raise_for_status()
-        with open(output_path, "wb") as f:
-            f.write(r.content)
-        return True
+        caption_data = _generate_caption_gemini(topic, niche)
+        if caption_data: return caption_data
     except Exception as e:
-        print(f"WARN: Pexels image download failed: {e}", file=sys.stderr)
-        return False
+        logging.warning(f"Gemini failed ({e}), falling back to template.")
 
+    return {
+        "caption": f"Did you know? {topic}\n\nMost people are missing this truth about {niche}. Like and save if you found this valuable!\n\n#mindblown #{niche}",
+        "hashtags": [niche, "mindblown", "facts", "trending", "viral"]
+    }
 
-def create_post_image(content: dict, output_path: str) -> str:
-    """Create a styled Instagram post image."""
-    W, H = 1080, 1080
-
-    # Try to get background from Pexels
-    bg_path = output_path + ".bg.jpg"
-    has_bg = download_pexels_image(content.get("image_query", "technology"), bg_path)
-
-    if has_bg:
-        img = Image.open(bg_path).resize((W, H)).convert("RGBA")
-        # Dark overlay for readability
-        overlay = Image.new("RGBA", (W, H), (0, 0, 0, 180))
-        img = Image.alpha_composite(img, overlay).convert("RGB")
-        os.remove(bg_path)
-    else:
-        # Gradient background fallback
-        img = Image.new("RGB", (W, H), (20, 20, 40))
-        draw = ImageDraw.Draw(img)
-        for y in range(H):
-            r = int(20 + (y / H) * 30)
-            g = int(20 + (y / H) * 10)
-            b = int(40 + (y / H) * 60)
-            draw.line([(0, y), (W, y)], fill=(r, g, b))
-
-    draw = ImageDraw.Draw(img)
-
-    # Use default font (monospace available on ubuntu-latest)
+@retry(requests.exceptions.RequestException)
+def upload_image_to_hosting(image_path):
     try:
-        font_large = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 52)
-        font_medium = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 36)
-        font_small = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 28)
-    except OSError:
-        font_large = ImageFont.load_default()
-        font_medium = font_large
-        font_small = font_large
-
-    # Draw headline
-    headline = content.get("headline", "Daily Byte")
-    wrapped = textwrap.fill(headline, width=25)
-    draw.text((60, 120), wrapped, fill=(255, 255, 255), font=font_large)
-
-    # Draw subheadline
-    sub = content.get("subheadline", "")
-    draw.text((60, 280), sub, fill=(200, 200, 255), font=font_medium)
-
-    # Draw separator
-    draw.line([(60, 340), (W - 60, 340)], fill=(100, 100, 200), width=2)
-
-    # Draw bullet points
-    y_pos = 380
-    for point in content.get("points", [])[:5]:
-        wrapped_point = textwrap.fill(f"→ {point}", width=38)
-        draw.text((60, y_pos), wrapped_point, fill=(230, 230, 250), font=font_small)
-        line_count = len(wrapped_point.split("\n"))
-        y_pos += 40 * line_count + 20
-
-    # Draw footer / brand
-    draw.text((60, H - 100), "TheDailyByte", fill=(150, 150, 200), font=font_medium)
-    draw.text((60, H - 55), "Follow for daily insights ✦", fill=(120, 120, 170), font=font_small)
-
-    img.save(output_path, "JPEG", quality=95)
-    print(f"  Image saved: {output_path}")
-    return output_path
-
-
-# ──────────────────────────────────────────────────
-# 3. INSTAGRAM PUBLISH (Graph API)
-# ──────────────────────────────────────────────────
-
-def post_to_instagram(image_url: str, caption: str) -> bool:
-    """Publish image to Instagram via Graph API (requires hosted image URL)."""
-    access_token = os.environ.get("INSTAGRAM_ACCESS_TOKEN")
-    account_id = os.environ.get("INSTAGRAM_ACCOUNT_ID")
-
-    if not access_token or not account_id:
-        print("WARN: Instagram credentials not set, skipping post", file=sys.stderr)
-        return False
-
-    base_url = f"https://graph.facebook.com/v21.0/{account_id}"
-
-    try:
-        # Step 1: Create media container
-        create_resp = requests.post(f"{base_url}/media", data={
-            "image_url": image_url,
-            "caption": caption,
-            "access_token": access_token,
-        }, timeout=30)
-        create_resp.raise_for_status()
-        creation_id = create_resp.json().get("id")
-
-        if not creation_id:
-            print("ERROR: No creation_id returned", file=sys.stderr)
-            return False
-
-        # Step 2: Publish
-        publish_resp = requests.post(f"{base_url}/media_publish", data={
-            "creation_id": creation_id,
-            "access_token": access_token,
-        }, timeout=30)
-        publish_resp.raise_for_status()
-        media_id = publish_resp.json().get("id")
-        print(f"  ✓ Posted to Instagram! Media ID: {media_id}")
-        return True
-
+        with open(image_path, "rb") as f:
+            files = {"file": f}
+            r = requests.post("https://catbox.moe/user/api.php", data={"reqtype": "fileupload"}, files=files, timeout=30)
+            r.raise_for_status()
+            url = r.text.strip()
+            if url.startswith("http"):
+                logging.info(f"Image hosted via catbox.moe: {url}")
+                return url
     except Exception as e:
-        print(f"ERROR: Instagram post failed: {e}", file=sys.stderr)
-        return False
-
-
-def upload_image_to_hosting(image_path: str) -> str | None:
-    """
-    Instagram Graph API needs a publicly accessible URL.
-    We use the Pexels image directly if available, or skip posting.
-    For production, use Cloudinary/S3/Firebase Storage.
-    """
-    # For CI: use a temp image hosting approach
-    # The workflow should ideally upload to a CDN first
-    # For now, we'll note that the image was generated locally
-    print("  NOTE: Image generated locally. For Instagram posting,")
-    print("  configure a CDN (Cloudinary/S3) for public image hosting.")
+        logging.warning(f"catbox.moe upload failed: {e}, trying 0x0.st...")
+    
+    try:
+        with open(image_path, "rb") as f:
+            files = {"file": f}
+            r = requests.post("https://0x0.st", files=files, timeout=30)
+            r.raise_for_status()
+            url = r.text.strip()
+            if url.startswith("http"):
+                logging.info(f"Image hosted via 0x0.st: {url}")
+                return url
+    except Exception as e:
+        logging.warning(f"0x0.st upload failed: {e}")
+    
     return None
 
+def generate_image(topic, niche, output_path):
+    img_width, img_height = 1080, 1350
+    img = Image.new("RGB", (img_width, img_height), color=(30, 30, 35))
+    draw = ImageDraw.Draw(img)
+    
+    try:
+        title_font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 48)
+        body_font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 32)
+    except OSError:
+        title_font = ImageFont.load_default()
+        body_font = ImageFont.load_default()
+    
+    accent_color = (50, 150, 255)
+    draw.rectangle([(0, 0), (img_width, 200)], fill=accent_color)
+    
+    y_pos = 50
+    draw.text((50, y_pos), f"{niche.upper()}", fill=(255, 255, 255), font=body_font)
+    
+    y_pos = 250
+    max_width = img_width - 100
+    words = topic.split()
+    lines = []
+    current_line = []
+    
+    for word in words:
+        current_line.append(word)
+        line_text = " ".join(current_line)
+        bbox = draw.textbbox((0, 0), line_text, font=title_font)
+        line_width = bbox[2] - bbox[0]
+        if line_width > max_width:
+            current_line.pop()
+            lines.append(" ".join(current_line))
+            current_line = [word]
+    
+    if current_line:
+        lines.append(" ".join(current_line))
+    
+    for line in lines:
+        draw.text((50, y_pos), line, fill=(255, 255, 255), font=title_font)
+        y_pos += 80
+    
+    y_pos = 1000
+    draw.text((50, y_pos), "Swipe up for the full story", fill=(200, 200, 200), font=body_font)
+    
+    overlay = Image.new("RGBA", img.size, (0, 0, 0, 80))
+    img = Image.alpha_composite(img.convert("RGBA"), overlay).convert("RGB")
+    
+    img.save(output_path)
+    logging.info(f"Image generated: {output_path}")
 
-# ──────────────────────────────────────────────────
-# MAIN
-# ──────────────────────────────────────────────────
+async def tts(text, path, voice, rate):
+    await edge_tts.Communicate(text, voice, rate=rate).save(path)
+
+@retry(Exception)
+def upload_instagram(image_url, caption_text, hashtags):
+    if not INSTAGRAM_BUSINESS_ACCOUNT_ID or not INSTAGRAM_ACCESS_TOKEN:
+        logging.warning("Instagram credentials not set, skipping upload.")
+        return
+    
+    caption = f"{caption_text}\n\n" + " ".join(f"#{tag}" for tag in hashtags)
+    
+    url = f"https://graph.instagram.com/{INSTAGRAM_BUSINESS_ACCOUNT_ID}/media"
+    params = {"access_token": INSTAGRAM_ACCESS_TOKEN}
+    data = {"image_url": image_url, "caption": caption}
+    
+    try:
+        r = requests.post(url, params=params, json=data, timeout=30)
+        r.raise_for_status()
+        media_id = r.json().get("id")
+        logging.info(f"Posted to Instagram: {media_id}")
+        
+        publish_url = f"https://graph.instagram.com/{INSTAGRAM_BUSINESS_ACCOUNT_ID}/media_publish"
+        publish_data = {"creation_id": media_id}
+        r = requests.post(publish_url, params=params, json=publish_data, timeout=30)
+        r.raise_for_status()
+        logging.info(f"Published to Instagram feed")
+    except Exception as e:
+        logging.error(f"Instagram upload failed: {e}")
+        raise
 
 def main():
-    parser = argparse.ArgumentParser(description="TheDailyByte Instagram Pipeline")
-    parser.add_argument("--topic", default="", help="Post topic (blank=auto)")
-    parser.add_argument("--niche", default="tech", help="Content niche")
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--topic", default="")
+    parser.add_argument("--niche", default="tech")
     args = parser.parse_args()
-
-    output_dir = os.environ.get("OUTPUT_DIR", "./output")
-    os.makedirs(output_dir, exist_ok=True)
-
-    print(f"\n{'='*50}")
-    print(f"  TheDailyByte — Instagram Pipeline")
-    print(f"  Niche: {args.niche}")
-    print(f"{'='*50}\n")
-
-    # Step 1: Generate content
-    print("[1/3] Generating post content with Gemini...")
-    content = generate_post_content(args.topic, args.niche)
-    print(f"  Headline: {content.get('headline', 'N/A')}")
-
-    # Step 2: Create image
-    print("\n[2/4] Creating post image...")
-    image_path = os.path.join(output_dir, "post.jpg")
     
-    # Try enhanced image generation
-    try:
-        from insta_image_pro import create_instagram_image
-        create_instagram_image(content, image_path, args.niche)
-    except Exception as e:
-        print(f"  Pro image gen failed ({e}), using basic template")
-        create_post_image(content, image_path)
+    topic = pick_topic(args.topic, args.niche)
+    caption_data = generate_caption(topic, args.niche)
+    
+    logging.info("[1/4] Generating image...")
+    image_path = Path(OUTPUT_DIR) / f"{topic.replace(' ', '_').replace('/', '')}.jpg"
+    generate_image(topic, args.niche, str(image_path))
+    
+    logging.info("[2/4] Hosting image...")
+    image_url = upload_image_to_hosting(str(image_path))
+    if not image_url:
+        logging.error("Failed to host image, aborting upload")
+        return
+    
+    logging.info("[3/4] Preparing caption...")
+    caption = caption_data.get("caption", f"Check out: {topic}")
+    hashtags = caption_data.get("hashtags", [args.niche])
+    
+    logging.info("[4/4] Uploading to Instagram...")
+    upload_instagram(image_url, caption, hashtags)
+    
+    logging.info("Instagram Pipeline Complete!")
 
-    # Step 3: Optimize caption
-    print("\n[3/4] Optimizing caption for engagement...")
-    try:
-        from insta_seo import optimize_caption
-        caption = optimize_caption(content.get("caption", ""), args.niche)
-        print(f"  Caption preview: {caption[:100]}...")
-    except Exception as e:
-        print(f"  SEO optimization failed ({e}), using raw caption")
-        caption = content.get("caption", "")
-
-    # Step 4: Post to Instagram
-    print("\n[4/4] Publishing to Instagram...")
-    image_url = upload_image_to_hosting(image_path)
-
-    if image_url:
-        post_to_instagram(image_url, caption)
-    else:
-        print("  Image generated but not posted (no CDN configured).")
-        print(f"  Caption:\n{caption[:200]}...")
-
-    print("\n✓ Pipeline complete!")
-
-
-if __name__ == "__main__":
-    main()
+if __name__=="__main__": main()
