@@ -230,6 +230,69 @@ def upload_instagram(image_url, caption_text, hashtags):
         logging.error(f"Instagram upload failed: {e}")
         raise
 
+def generate_post_content(topic: str, niche: str = "tech") -> dict:
+    """Generate complete post content dict for batch processing.
+    Returns: {headline, subheadline, points, caption, hashtags}
+    Self-healing: always returns valid content even if AI fails.
+    """
+    # Attempt AI-powered content
+    content = None
+    api_key = GEMINI_API_KEY
+    if api_key:
+        try:
+            try:
+                import google.genai as genai
+            except ImportError:
+                import google.generativeai as genai
+            genai.configure(api_key=api_key.strip(), transport="rest")
+            model = genai.GenerativeModel("gemini-1.5-flash")
+            prompt = (
+                f"Create Instagram carousel content about: {topic}. Niche: {niche}.\n"
+                "Return JSON only (no markdown fences):\n"
+                '{ "headline": "max 50 chars", "subheadline": "max 80 chars", '
+                '"points": ["point1","point2","point3","point4","point5"], '
+                '"caption": "engaging caption max 200 chars", '
+                '"hashtags": ["tag1","tag2","tag3","tag4","tag5"] }'
+            )
+            response = model.generate_content(prompt)
+            text = response.text.strip()
+            if text.startswith("```"):
+                text = text.split("\n", 1)[1] if "\n" in text else text[3:]
+            if text.endswith("```"):
+                text = text.rsplit("```", 1)[0]
+            content = json.loads(text.strip())
+            logging.info(f"AI content generated for: {topic}")
+        except Exception as e:
+            logging.warning(f"AI content generation failed ({e}), using template fallback.")
+
+    # Template fallback — always works, zero dependencies
+    if not content or not isinstance(content, dict):
+        words = topic.split()
+        short_topic = " ".join(words[:6]) if len(words) > 6 else topic
+        content = {
+            "headline": short_topic[:50],
+            "subheadline": f"What you need to know about {niche}",
+            "points": [
+                f"The truth about {topic}",
+                "Most people miss this completely",
+                "Science-backed insight inside",
+                f"Why {niche} experts are paying attention",
+                "Save this for later"
+            ],
+            "caption": f"Did you know? {topic}\n\nMost people overlook this. Like & save if you found this valuable!",
+            "hashtags": [niche, "facts", "trending", "viral", "dailybyte"]
+        }
+
+    # Ensure all required keys exist (self-healing)
+    content.setdefault("headline", topic[:50])
+    content.setdefault("subheadline", f"Latest in {niche}")
+    content.setdefault("points", [f"Key insight about {topic}"])
+    content.setdefault("caption", f"Check out: {topic}")
+    content.setdefault("hashtags", [niche, "dailybyte"])
+
+    return content
+
+
 def main():
     import argparse
     parser = argparse.ArgumentParser()
