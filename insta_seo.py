@@ -1,7 +1,14 @@
 #!/usr/bin/env python3
 """Instagram SEO — Viral Caption Optimization"""
 import random, os, json
-import google.generativeai as genai
+
+try:
+    import google.genai as genai
+except ImportError:
+    try:
+        import google.generativeai as genai
+    except ImportError:
+        genai = None
 
 # High-engagement hashtag clusters
 HASHTAG_SETS = {
@@ -33,7 +40,7 @@ def optimize_caption(raw_caption: str, niche: str, use_ai: bool = True) -> str:
     # Try AI enhancement
     if use_ai:
         api_key = os.getenv("GEMINI_API_KEY", "").strip()
-        if api_key:
+        if api_key and genai:
             try:
                 genai.configure(api_key=api_key, transport="rest")
                 model = genai.GenerativeModel("gemini-1.5-flash")
